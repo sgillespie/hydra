@@ -350,7 +350,14 @@ sub inputsToArgs {
 
 
 sub evalJobs {
-    my ($jobsetName, $inputInfo, $nixExprInputName, $nixExprPath, $flakeRef) = @_;
+    my (
+        $jobsetName,
+        $inputInfo,
+        $nixExprInputName,
+        $nixExprPath,
+        $flakeRef,
+        $eachJob
+    ) = @_;
 
     print STDERR "($jobsetName) Evaluating...\n";
 
@@ -391,9 +398,16 @@ sub evalJobs {
 
     print STDERR "$stderr";
 
-    return decode_json($jobsJSON);
-}
+    my $json = decode_json($jobsJSON);
+    if ($eachJob) {
+        foreach my $jobName (keys %{$json}) {
+            &$eachJob($jobName, $json->{$jobName});
+        }
+    }
 
+
+    return $json;
+}
 
 # Return the most recent evaluation of the given jobset (that
 # optionally had new builds), or undefined if no such evaluation
@@ -685,73 +699,19 @@ sub checkJobsetWrapped {
         return;
     }
 
-    # Evaluate the job expression.
-    my $evalStart = clock_gettime(CLOCK_MONOTONIC);
-    my $jobs = evalJobs($project->name . ":" . $jobset->name, $inputInfo, $jobset->nixexprinput, $jobset->nixexprpath, $flakeRef);
-    my $evalStop = clock_gettime(CLOCK_MONOTONIC);
-
-    if ($jobsetsJobset) {
-        my @keys = keys %$jobs;
-        die "The .jobsets jobset must only have a single job named 'jobsets'"
-            unless (scalar @keys) == 1 && $keys[0] eq "jobsets";
-    }
-    Net::Statsd::timing("hydra.evaluator.eval_time", int(($evalStop - $evalStart) * 1000));
-
-    if ($dryRun) {
-        foreach my $name (keys %{$jobs}) {
-            my $job = $jobs->{$name};
-            if (defined $job->{drvPath}) {
-                print STDERR "good job $name: $job->{drvPath}\n";
-            } else {
-                print STDERR "failed job $name: $job->{error}\n";
-            }
-        }
-        return;
-    }
-
-    die "Jobset contains a job with an empty name. Make sure the jobset evaluates to an attrset of jobs.\n"
-        if defined $jobs->{""};
-
-    $jobs->{$_}->{jobName} = $_ for keys %{$jobs};
-
     my $jobOutPathMap = {};
     my $jobsetChanged = 0;
     my $dbStart = clock_gettime(CLOCK_MONOTONIC);
 
-
-    # Store the error messages for jobs that failed to evaluate.
-    my $evaluationErrorTime = time;
-    my $evaluationErrorMsg = "";
-    foreach my $job (values %{$jobs}) {
-        next unless defined $job->{error};
-        $evaluationErrorMsg .=
-            ($job->{jobName} ne "" ? "in job ‘$job->{jobName}’" : "at top-level") .
-            ":\n" . $job->{error} . "\n\n";
-    }
-    setJobsetError($jobset, $evaluationErrorMsg, $evaluationErrorTime);
-
-    my $evaluationErrorRecord = $db->resultset('EvaluationErrors')->create(
-        { errormsg => $evaluationErrorMsg
-        , errortime => $evaluationErrorTime
-        }
-    );
-
     my %buildMap;
     $db->txn_do(sub {
-
-        my $prevEval = getPrevJobsetEval($db, $jobset, 1);
-
-        # Clear the "current" flag on all builds.  Since we're in a
-        # transaction this will only become visible after the new
-        # current builds have been added.
-        $jobset->builds->search({iscurrent => 1})->update({iscurrent => 0});
-
+        # When streaming JSON, we'll do the whole thing in a db transaction
+        # Evaluate the job expression.
         my $ev = $jobset->jobsetevals->create(
             { hash => $argsHash
-            , evaluationerror => $evaluationErrorRecord
             , timestamp => time
             , checkouttime => abs(int($checkoutStop - $checkoutStart))
-            , evaltime => abs(int($evalStop - $evalStart))
+            , evaltime => 0
             , hasnewbuilds => 0
             , nrbuilds => 0
             , flake => $flakeRef
@@ -759,12 +719,87 @@ sub checkJobsetWrapped {
             , nixexprpath => $jobset->nixexprpath
             });
 
-        # Schedule each successfully evaluated job.
-        foreach my $job (permute(values %{$jobs})) {
-            next if defined $job->{error};
+        my $prevEval = getPrevJobsetEval($db, $jobset, 1);
+
+        my $eachJob = sub {
+            my ($jobName, $job) = @_;
+
+            # Print out jobs and their path during dry run
+            if ($dryRun) {
+                if (defined $job->{drvPath}) {
+                    print STDERR "good job $jobName: $job->{drvPath}\n";
+                } else {
+                    print STDERR "failed job $jobName: $job->{error}\n";
+                }
+
+                # Stop here
+                return;
+            }
+
+            # Fill in job name
+            $job->{jobName} = $jobName;
+
+            # Can't have empty job names
+            die "Jobset contains a job with an empty name. Make sure the jobset evaluates to an attrset of jobs.\n"
+                if defined $jobName eq "";
+
+            # Schedule each successfully evaluated job.
+            return if defined $job->{error};
+
             #print STDERR "considering job " . $project->name, ":", $jobset->name, ":", $job->{jobName} . "\n";
             checkBuild($db, $jobset, $ev, $inputInfo, $job, \%buildMap, $prevEval, $jobOutPathMap, $plugins);
+        };
+
+        my $evalStart = clock_gettime(CLOCK_MONOTONIC);
+        my $jobs = evalJobs(
+            $project->name . ":" . $jobset->name,
+            $inputInfo,
+            $jobset->nixexprinput,
+            $jobset->nixexprpath,
+            $flakeRef,
+            $eachJob
+            );
+        my $evalStop = clock_gettime(CLOCK_MONOTONIC);
+
+        if ($jobsetsJobset) {
+            my @keys = keys %$jobs;
+            die "The .jobsets jobset must only have a single job named 'jobsets'"
+                unless (scalar @keys) == 1 && $keys[0] eq "jobsets";
         }
+        Net::Statsd::timing("hydra.evaluator.eval_time", int(($evalStop - $evalStart) * 1000));
+
+        return if $dryRun;
+
+        # Store the error messages for jobs that failed to evaluate.
+        my $evaluationErrorTime = time;
+        my $evaluationErrorMsg = "";
+        foreach my $job (values %{$jobs}) {
+            next unless defined $job->{error};
+            $evaluationErrorMsg .=
+                ($job->{jobName} ne "" ? "in job ‘$job->{jobName}’" : "at top-level") .
+                ":\n" . $job->{error} . "\n\n";
+        }
+        setJobsetError($jobset, $evaluationErrorMsg, $evaluationErrorTime);
+
+        my $evaluationErrorRecord = $db->resultset('EvaluationErrors')->create(
+            { errormsg => $evaluationErrorMsg
+                  , errortime => $evaluationErrorTime
+            }
+        );
+
+
+
+        # Clear the "current" flag on all builds.  Since we're in a
+        # transaction this will only become visible after the new
+        # current builds have been added.
+        $jobset->builds->search({iscurrent => 1})->update({iscurrent => 0});
+
+        $ev->update(
+            { evaluationerror => $evaluationErrorRecord
+            , evaltime => abs(int($evalStop - $evalStart))
+            });
+
+
 
         # Have any builds been added or removed since last time?
         $jobsetChanged =
